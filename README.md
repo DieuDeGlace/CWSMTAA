@@ -49,3 +49,9 @@ No Omega-equivalence or universal crash-free claim is made.
 The GPU test covers temporal reconstruction, individual/hybrid display paths,
 unblurred history, native depth/state restoration, sharp HUD, and twelve resets.
 Run `build\tests\TemporalGpuTest.exe`. Tests passed locally on 2026-10-11.
+
+## Source formatting
+
+The project uses the checked-in `.clang-format` style (four-space indentation and a 100-column target). From the repository root, run `clang-format -i src/*.cpp src/*.h` on the source files that exist. Keep third-party SMAA files and embedded shader strings unchanged.
+
+The cleanup was rebuilt with MSVC for x86 and checked against the previous revision for identical executable tokens and shader strings. Runtime settings and installed DLLs are unchanged.
