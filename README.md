@@ -1,57 +1,30 @@
-# CWSMTAA
+# CWSMTAA: Steam stable TAA test
 
-Steam-method temporal anti-aliasing for Cube World Alpha, with SMAA Ultra and display-only softness.
+Branch `test/steam-stable-taa` ports Steam TemporalAA's accepted `main` behavior at `2e0d10b` to Alpha D3D9. `main` retains the accepted Alpha SMAA/display-softness build. Made by DieuDeGlace with AI assistance from OpenAI ChatGPT/Codex.
 
-Made by DieuDeGlace with AI assistance from OpenAI ChatGPT/Codex. MIT licensed. No game executable, game assets, saves, or runtime journals are included.
+The source Steam chat restored stable color-history TAA and rejected its depth-reprojection/SMAA experiment for cost. This branch therefore uses the accepted eight-sample Halton sequence at 0.75 strength, 65% bounded history, thin-detail retention and mild 0.12 blur fused into the temporal resolve. Existing samples provide the blur; it adds no texture samples or fullscreen pass. The mild filtered resolve is stored as history, matching Steam's method. Optional legacy display filters never feed back into history.
 
-## Build
+SMAA and the separate display-softness pass are disabled by default, removing four display passes and three full-resolution intermediates compared with Alpha's accepted hybrid setup. Optional legacy resources are allocated only if requested. Native depth remains untouched: there is no depth replay, motion-vector buffer or camera-reprojection experiment. Native world/HUD separation, rejection, Reset handling and shared shadow jitter remain intact.
 
-Install Visual Studio 2022 Build Tools with Desktop development with C++ and
-the Windows SDK. Open an **x86 Native Tools Command Prompt for VS 2022**.
-These Alpha DLLs are 32-bit; an x64 build will not load into Cube.exe.
+D3D11 projection-buffer upload reuse cannot be copied literally because Alpha uses per-object combined WVP constants and restores them after each draw. This port keeps the native D3D9 constant path. Sparse GPU timestamps measure copy/resolve cost on supporting devices without flushing or waiting. Actual Alpha visual quality and FPS still require live testing.
 
-```bat
-git clone https://github.com/DieuDeGlace/CWSMTAA.git
-cd CWSMTAA
-build.cmd
+## Build and install
+
+Use an **x86 Native Tools Command Prompt** with Visual Studio Build Tools and a Windows SDK, then run `build.cmd`. `build\tests\TemporalGpuTest.exe` exercises default and optional filter paths plus twelve resets. Output is `build/Mods/AlphaTAA.dll`.
+
+Close Alpha, place the DLL in `Mods` and `config/AlphaTemporal.ini` in `graphics-rebuild`; restart through the mod loader. Disable native AA. Pair with AlphaCWShadows's `test/steam-cascades` branch. F8 toggles TAA; F9 toggles optional SMAA and recreates its resources.
+
+## Settings
+
+```
+[TAA]
+HistoryPercent=65
+SMAAEnabled=0
+DisplaySoftness=0
+ResolveBlur=0.12
+JitterScale=0.75
 ```
 
-The DLL appears under `build/Mods/`. No toolchain or game files are bundled.
-Builds use C++17, /O2 /MT /EHsc, Unicode, and the Windows SDK. clang-cl in an
-x86 MSVC environment may be substituted for cl. Test programs are built into
-`build/tests/`; run them with Alpha and other exclusive-fullscreen games closed.
-GPU tests require a working Windows D3D9 driver and do not measure in-game FPS.
+`ResolveBlur` and `JitterScale` accept 0-1. The old SMAA/display-softness path remains available for comparison, but the test defaults match stable Steam TAA. The previous accepted DLL/settings and main source are backed up in `graphics-rebuild/backups/accepted-before-steam-cascades` for rollback with Alpha closed.
 
-## Install
-
-Close Alpha, extract the release ZIP into the Alpha game folder, and launch
-through the Alpha mod loader. The ZIP's `Mods` folder must merge with the
-game's existing `Mods` folder. Keep the included configuration/support folders.
-The repository name is the project name; the established DLL filename stays
-unchanged for compatibility. Remove the DLL with the game closed to uninstall.
-
-## Rendering and controls
-
-Steam-style eight-sample Halton jitter, linear reconstruction, neighborhood
-history bounds, color-change rejection, and thin-detail history retention.
-SMAA Ultra and 50% 3x3 Gaussian softness run **after storing temporal history**,
-before the HUD. There is no depth replacement or motion-vector buffer.
-
-`graphics-rebuild/AlphaTemporal.ini`: HistoryPercent=65 (0–85), SMAAEnabled=1,
-DisplaySoftness=0.50 (0–1). F8 toggles the temporal setup; F9 toggles SMAA.
-Keep built-in AA off. AlphaCWShadows can share this mod's actual scene jitter.
-
-Runtime compilation requires Windows d3dcompiler_47.dll. Native MSAA is not
-supported by this prototype. The user reported improved, stable visuals;
-**distant banding/shimmer remains**. Added display passes can affect performance.
-No Omega-equivalence or universal crash-free claim is made.
-
-The GPU test covers temporal reconstruction, individual/hybrid display paths,
-unblurred history, native depth/state restoration, sharp HUD, and twelve resets.
-Run `build\tests\TemporalGpuTest.exe`. Tests passed locally on 2026-10-11.
-
-## Source formatting
-
-The project uses the checked-in `.clang-format` style (four-space indentation and a 100-column target). From the repository root, run `clang-format -i src/*.cpp src/*.h` on the source files that exist. Keep third-party SMAA files and embedded shader strings unchanged.
-
-The cleanup was rebuilt with MSVC for x86 and checked against the previous revision for identical executable tokens and shader strings. Runtime settings and installed DLLs are unchanged.
+Code follows the checked-in `.clang-format`. Preserve third-party SMAA files and embedded shader strings. MIT licensed; retained SMAA code/lookups have their own license in `THIRD_PARTY_NOTICES.md`. No game assets, proprietary shaders or saves are included.

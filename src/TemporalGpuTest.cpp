@@ -33,6 +33,11 @@ int main() {
         useSMAA = (cycle % 4) >= 2;
         displaySoftness = cycle % 2 ? .5f : 0.f;
         assert(initialize());
+        if (!useSMAA)
+            assert(!edgesTexture && !weightsTexture && !spatialTexture && !areaLookup &&
+                   !searchLookup);
+        if (displaySoftness <= 0)
+            assert(!softnessShader);
         assert(!valid);
         for (int f = 0; f < 3; f++) {
             assert(SUCCEEDED(dev->BeginScene()));
@@ -102,6 +107,6 @@ int main() {
     drop(api);
     DestroyWindow(window);
     puts(
-        "PASS: temporal-only, softness-only, SMAA-only postfilter, hybrid; history stays unblurred; native depth/state, HUD exclusion, twelve device resets.");
+        "PASS: fused resolve blur, optional legacy display filters without feedback, no unused display resources; native depth/state, HUD exclusion, twelve device resets.");
     return 0;
 }
