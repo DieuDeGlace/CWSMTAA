@@ -28,3 +28,9 @@ JitterScale=0.75
 `ResolveBlur` and `JitterScale` accept 0-1. The old SMAA/display-softness path remains available for comparison, but the test defaults match stable Steam TAA. The previous accepted DLL/settings and main source are backed up in `graphics-rebuild/backups/accepted-before-steam-cascades` for rollback with Alpha closed.
 
 Code follows the checked-in `.clang-format`. Preserve third-party SMAA files and embedded shader strings. MIT licensed; retained SMAA code/lookups have their own license in `THIRD_PARTY_NOTICES.md`. No game assets, proprietary shaders or saves are included.
+
+## Edge-stability refinement
+
+`EdgeStability=0.24` (0-0.5) blends a Gaussian reconstruction into high-contrast edges using the same existing 3x3 samples. The spatial filter remains active when history is rejected, preventing abrupt loss of edge coverage on moving shapes. Flat pixels are unchanged. It adds arithmetic only, with no new samples, textures, fullscreen passes or object replay. This is a local spatial stabilizer, not object-motion vectors. It can soften high-contrast terrain edges as well as model edges.
+
+The synthetic subpixel fixture reduces peak-to-peak intensity range from 89 to 70 for a thin edge and 95 to 89 for a broad silhouette, with flat pixels unchanged. In-game jitter reduction is not yet confirmed.

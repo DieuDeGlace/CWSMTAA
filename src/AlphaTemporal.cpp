@@ -65,18 +65,19 @@ static IDirect3DTexture9 *edgesTexture = nullptr, *weightsTexture = nullptr,
                          *spatialTexture = nullptr, *areaLookup = nullptr, *searchLookup = nullptr;
 static IDirect3DPixelShader9 *smaaShaders[3]{}, *softnessShader = nullptr;
 static bool useSMAA = false;
-static float displaySoftness = 0, resolveBlur = .12f, jitterScale = .75f;
+static float displaySoftness = 0, resolveBlur = .12f, jitterScale = .75f, edgeStability = .24f;
 static float previousCamera[4]{}, previousProjection[2]{};
 static bool cameraKnown = false;
 static std::map<IDirect3DVertexShader9 *, bool> worldShaders;
 static const char *hlsl = R"HLSL(
 sampler2D scene:register(s0);sampler2D history:register(s1);
 float4 settings:register(c0);float4 offsets:register(c1);
+float4 edgeRules:register(c2);
 float4 resolve(float2 uv:TEXCOORD0):COLOR0{
  float2 original=uv;uv+=offsets.xy;float4 current=tex2D(scene,uv);
- float3 lo=current.rgb,hi=current.rgb,left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
+ float3 lo=current.rgb,hi=current.rgb,left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb,gaussian=0;
  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){
-  float3 c=tex2D(scene,uv+float2(x,y)*settings.xy).rgb;lo=min(lo,c);hi=max(hi,c);
+  float3 c=tex2D(scene,uv+float2(x,y)*settings.xy).rgb;lo=min(lo,c);hi=max(hi,c);gaussian+=c*(x==0?2:1)*(y==0?2:1);
   if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
  }
  float3 old=tex2D(history,original).rgb;
@@ -85,7 +86,11 @@ float4 resolve(float2 uv:TEXCOORD0):COLOR0{
  float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
  float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
  float accumulation=lerp(settings.z,max(settings.z,.78),thin);
+ float contrast=saturate(4*max(hi.r-lo.r,max(hi.g-lo.g,hi.b-lo.b)));
+ // Spatial coverage must stay consistent even when temporal history is rejected.
+ float stability=saturate(edgeRules.x)*contrast;
  float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,saturate(offsets.w));
+ filtered=lerp(filtered,gaussian/16,stability);
  return float4(lerp(filtered,clamp(old,lo,hi),accumulation*settings.w*confidence),current.a);
 }
 float4 soften(float2 uv:TEXCOORD0):COLOR0{
@@ -339,6 +344,8 @@ static bool apply() {
         float constants[8] = {1.f / width, 1.f / height, weight, valid ? 1.f : 0.f,
                               jx / width,  jy / height,  0,      resolveBlur};
         dev->SetPixelShaderConstantF(0, constants, 2);
+        float stability[4] = {edgeStability, 0, 0, 0};
+        dev->SetPixelShaderConstantF(2, stability, 1);
         struct Vertex {
             float x, y, z, w, u, v;
         };
@@ -517,6 +524,8 @@ static DWORD WINAPI worker(void *) {
     resolveBlur = std::clamp((float)_wtof(value), 0.f, 1.f);
     GetPrivateProfileStringW(L"TAA", L"JitterScale", L"0.75", value, 32, ini.c_str());
     jitterScale = std::clamp((float)_wtof(value), 0.f, 1.f);
+    GetPrivateProfileStringW(L"TAA", L"EdgeStability", L"0.24", value, 32, ini.c_str());
+    edgeStability = std::clamp((float)_wtof(value), 0.f, .5f);
     DWORD base = (DWORD)(uintptr_t)GetModuleHandleW(nullptr);
     IMAGE_DOS_HEADER dos{};
     read(base, &dos, sizeof(dos));

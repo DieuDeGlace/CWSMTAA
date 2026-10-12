@@ -1,9 +1,5 @@
 # Validation
 
-2026-10-11: MSVC x86 /O2 build and hidden HAL D3D9 tests pass.
+2026-10-11: MSVC x86 /O2 build and hidden HAL D3D9 checks pass. Synthetic high-contrast subpixel variation is reduced from 89 to 70 for a thin edge and 95 to 89 for a silhouette; flat black/white pixels are unchanged. Default and optional display-filter paths retain native depth/state and HUD exclusion across twelve resets.
 
-Fused resolve blur, optional legacy filters, absence of unused intermediates, history without display-filter feedback, native depth/state restoration, HUD exclusion and twelve device resets pass.
-
-DLL SHA256: DD92A295A4917925AE25A1A7E95C14997F1D9CFBEA9738BB65F4988E8E67C9B0
-
-The accepted pre-test Alpha DLLs/settings and main source archives are preserved. Current experimental Alpha appearance, moving-leaf alignment with cascades, Alt+Tab and GPU/FPS cost remain unverified in-game. Main branches are unchanged.
+The previous test build was reported visually improved, stable and fast, but models still jittered. This refinement requires live model-jitter and FPS verification. Cloud speed remains unchanged until that check.
