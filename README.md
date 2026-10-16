@@ -32,23 +32,47 @@ unchanged for compatibility. Remove the DLL with the game closed to uninstall.
 
 ## Rendering and controls
 
-Steam-style eight-sample Halton jitter, linear reconstruction, neighborhood
-history bounds, color-change rejection, and thin-detail history retention.
-SMAA Ultra and 50% 3x3 Gaussian softness run **after storing temporal history**,
-before the HUD. There is no depth replacement or motion-vector buffer.
+Steam-style eight-sample Halton jitter (scaled by JitterScale), linear
+reconstruction and a fused resolve blur. Ported from the Steam TemporalAA
+fixes (2026-10-13):
 
-`graphics-rebuild/AlphaTemporal.ini`: HistoryPercent=65 (0–85), SMAAEnabled=1,
-DisplaySoftness=0.50 (0–1). F8 toggles the temporal setup; F9 toggles SMAA.
-Keep built-in AA off. AlphaCWShadows can share this mod's actual scene jitter.
+- History is clipped toward the current pixel's color until it enters this
+  frame's 3x3 neighborhood, so edges only show mixes of real colors (no
+  green/red/yellow/blue fringes from per-channel box corners).
+- History is released only when the clip had to move it (real change), not
+  because it differs from the jittered current pixel, which made strong
+  edges shimmer.
+- Edges and thin details keep up to EdgeHistoryPercent (default 90) of
+  history; flat areas keep HistoryPercent (default 65).
+- Luminance-weighted (Karis) blend of current and history.
+- The draw hooks look up the back buffer and device state once per frame
+  instead of on every world draw.
+
+The Steam version's depth-based camera reprojection is **not** ported: Alpha's
+D3D9 depth buffer is not readable without replacing it, and this mod keeps
+native depth. History is read at the same pixel and released on large camera
+cuts or zoom changes, as before.
+
+SMAA Ultra is on by default and runs on the resolved image **after storing
+temporal history**, before the HUD; optional 3x3 Gaussian display softness
+also runs there. There is no depth replacement or motion-vector buffer.
+
+`graphics-rebuild/AlphaTemporal.ini`: HistoryPercent=65 (0-85),
+EdgeHistoryPercent=90 (0-95), SMAAEnabled=1, DisplaySoftness=0 (0-1),
+ResolveBlur=0.12, JitterScale=0.75, EdgeStability=0.24 (0-0.5). F8 toggles
+the temporal setup; F9 toggles SMAA. Keep built-in AA off. AlphaCWShadows can
+share this mod's actual scene jitter.
 
 Runtime compilation requires Windows d3dcompiler_47.dll. Native MSAA is not
-supported by this prototype. The user reported improved, stable visuals;
-**distant banding/shimmer remains**. Added display passes can affect performance.
+supported by this prototype. Added display passes can affect performance.
 No Omega-equivalence or universal crash-free claim is made.
 
 The GPU test covers temporal reconstruction, individual/hybrid display paths,
-unblurred history, native depth/state restoration, sharp HUD, and twelve resets.
-Run `build\tests\TemporalGpuTest.exe`. Tests passed locally on 2026-10-11.
+unblurred history, native depth/state restoration, sharp HUD, twelve resets,
+edge stability, a static slanted edge under the full jitter sequence (mean
+per-pixel range over settled frames 14.47 before the port, 1.19 after) and a
+panning grass/stone edge over a sky horizon (worst distance from a real
+color mix 2.3 of 255). Run `build\tests\TemporalGpuTest.exe`.
 
 ## Source formatting
 

@@ -64,15 +64,18 @@ static IDirect3DPixelShader9 *shader = nullptr;
 static IDirect3DTexture9 *edgesTexture = nullptr, *weightsTexture = nullptr,
                          *spatialTexture = nullptr, *areaLookup = nullptr, *searchLookup = nullptr;
 static IDirect3DPixelShader9 *smaaShaders[3]{}, *softnessShader = nullptr;
-static bool useSMAA = false;
+static bool useSMAA = true;
 static float displaySoftness = 0, resolveBlur = .12f, jitterScale = .75f, edgeStability = .24f;
+// History kept on edges and thin details, where jitter alone changes coverage.
+static float edgeHistory = .90f;
 static float previousCamera[4]{}, previousProjection[2]{};
 static bool cameraKnown = false;
 static std::map<IDirect3DVertexShader9 *, bool> worldShaders;
 static const char *hlsl = R"HLSL(
 sampler2D scene:register(s0);sampler2D history:register(s1);
 float4 settings:register(c0);float4 offsets:register(c1);
-float4 edgeRules:register(c2);
+float4 edgeRules:register(c2); // x: edge stability, y: edge/thin-detail history weight
+float maxChannel(float3 v){return max(v.r,max(v.g,v.b));}
 float4 resolve(float2 uv:TEXCOORD0):COLOR0{
  float2 original=uv;uv+=offsets.xy;float4 current=tex2D(scene,uv);
  float3 lo=current.rgb,hi=current.rgb,left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb,gaussian=0;
@@ -80,18 +83,34 @@ float4 resolve(float2 uv:TEXCOORD0):COLOR0{
   float3 c=tex2D(scene,uv+float2(x,y)*settings.xy).rgb;lo=min(lo,c);hi=max(hi,c);gaussian+=c*(x==0?2:1)*(y==0?2:1);
   if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
  }
- float3 old=tex2D(history,original).rgb;
- float disagreement=max(abs(old.r-current.r),max(abs(old.g-current.g),abs(old.b-current.b)));
- float3 lr=(left-current.rgb)*(right-current.rgb),ud=(up-current.rgb)*(down-current.rgb);
- float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
- float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
- float accumulation=lerp(settings.z,max(settings.z,.78),thin);
- float contrast=saturate(4*max(hi.r-lo.r,max(hi.g-lo.g,hi.b-lo.b)));
+ float3 raw=tex2D(history,original).rgb;
+ // Steam port: bound history to this frame's neighborhood by moving it along
+ // the line toward this pixel's own color until it enters the box, so the
+ // result is always a mix of two real colors. A per-channel clamp could land
+ // on a box corner no neighbor has (green/red/yellow/blue lines on edges).
+ float3 offset=raw-current.rgb;
+ float3 room=offset>0?hi-current.rgb:lo-current.rgb;
+ float3 limits=abs(offset)>1e-5?saturate(room/offset):1;
+ float3 old=current.rgb+offset*min(limits.x,min(limits.y,limits.z));
+ // Jitter only moves edge coverage within the local range, so history inside
+ // the neighborhood is kept even when it differs from this jittered pixel;
+ // rejecting that difference made strong edges shimmer. History the clip had
+ // to move is a real change (motion, disocclusion, lighting) and is released.
+ float confidence=1-smoothstep(.02,.12,maxChannel(abs(raw-old)));
+ // Edges and thin details carry the jitter's coverage changes; accumulate
+ // them longer. Flat areas keep the configured history weight.
+ float edge=smoothstep(.04,.20,maxChannel(hi-lo));
+ float accumulation=lerp(settings.z,max(settings.z,edgeRules.y),edge)*settings.w*confidence;
+ float contrast=saturate(4*maxChannel(hi-lo));
  // Spatial coverage must stay consistent even when temporal history is rejected.
  float stability=saturate(edgeRules.x)*contrast;
  float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,saturate(offsets.w));
  filtered=lerp(filtered,gaussian/16,stability);
- return float4(lerp(filtered,clamp(old,lo,hi),accumulation*settings.w*confidence),current.a);
+ // Luminance-weighted (Karis) blend: bright samples cannot dominate the
+ // average across jitter phases, which steadies bright/dark edges.
+ float currentWeight=(1-accumulation)/(1+maxChannel(filtered));
+ float historyWeight=accumulation/(1+maxChannel(old));
+ return float4((filtered*currentWeight+old*historyWeight)/(currentWeight+historyWeight),current.a);
 }
 float4 soften(float2 uv:TEXCOORD0):COLOR0{
  float4 now=tex2D(scene,uv);float3 sum=0;
@@ -281,13 +300,28 @@ static HRESULT display(IDirect3DSurface9 *target) {
     drop(spatial);
     return hr;
 }
+// The back buffer and device state are looked up once per frame (Steam port:
+// draw hooks no longer re-inspect them on every world draw). The surface is
+// owned by the swap chain; its address is only compared.
+static IDirect3DSurface9 *frameBackBuffer = nullptr;
+static bool frameChecked = false, frameUsable = false;
 static bool backbuffer() {
-    IDirect3DSurface9 *rt = nullptr, *bb = nullptr;
+    if (!frameChecked) {
+        frameChecked = true;
+        frameUsable = SUCCEEDED(dev->TestCooperativeLevel());
+        IDirect3DSurface9 *bb = nullptr;
+        frameBackBuffer = nullptr;
+        if (frameUsable && SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+            frameBackBuffer = bb;
+            drop(bb);
+        }
+    }
+    if (!frameUsable || !frameBackBuffer)
+        return false;
+    IDirect3DSurface9 *rt = nullptr;
     dev->GetRenderTarget(0, &rt);
-    dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
-    bool same = rt && rt == bb;
+    bool same = rt && rt == frameBackBuffer;
     drop(rt);
-    drop(bb);
     return same;
 }
 static bool apply() {
@@ -344,7 +378,7 @@ static bool apply() {
         float constants[8] = {1.f / width, 1.f / height, weight, valid ? 1.f : 0.f,
                               jx / width,  jy / height,  0,      resolveBlur};
         dev->SetPixelShaderConstantF(0, constants, 2);
-        float stability[4] = {edgeStability, 0, 0, 0};
+        float stability[4] = {edgeStability, edgeHistory, 0, 0};
         dev->SetPixelShaderConstantF(2, stability, 1);
         struct Vertex {
             float x, y, z, w, u, v;
@@ -404,7 +438,7 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT b, UINT m
                           UINT p) {
     float saved[16]{};
     bool jittered = false;
-    if (!internal && enabled && !finished && backbuffer() && SUCCEEDED(d->TestCooperativeLevel())) {
+    if (!internal && enabled && !finished && backbuffer()) {
         IDirect3DVertexShader9 *vs = nullptr;
         d->GetVertexShader(&vs);
         bool accepted = worldShader(vs);
@@ -448,7 +482,7 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT b, UINT m
 static HRESULT WINAPI clear(IDirect3DDevice9 *d, DWORD n, const D3DRECT *r, DWORD flags, D3DCOLOR c,
                             float z, DWORD s) {
     if (!internal && worldSeen && !finished && (flags & D3DCLEAR_ZBUFFER) &&
-        !(flags & D3DCLEAR_TARGET) && backbuffer() && SUCCEEDED(d->TestCooperativeLevel()))
+        !(flags & D3DCLEAR_TARGET) && backbuffer())
         apply();
     return oldClear(d, n, r, flags, c, z, s);
 }
@@ -467,7 +501,7 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
         cleanup(); // Optional display resources are created only when requested.
         log(useSMAA ? "SMAA enabled." : "SMAA disabled; display softness retained.");
     }
-    worldSeen = finished = false;
+    worldSeen = finished = frameChecked = false;
     frame++;
     jx = halton(frame % 8 + 1, 2) * jitterScale;
     jy = halton(frame % 8 + 1, 3) * jitterScale;
@@ -479,7 +513,8 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
 static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
     cleanup();
     worldShaders.clear();
-    cameraKnown = worldSeen = finished = false;
+    cameraKnown = worldSeen = finished = frameChecked = false;
+    frameBackBuffer = nullptr;
     log("Temporal resources released before device reset.");
     return oldReset(d, p);
 }
@@ -516,7 +551,12 @@ static DWORD WINAPI worker(void *) {
     weight =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65, ini.c_str()), 0, 85) *
         .01f;
-    useSMAA = GetPrivateProfileIntW(L"TAA", L"SMAAEnabled", 0, ini.c_str()) != 0;
+    edgeHistory =
+        std::clamp((int)GetPrivateProfileIntW(L"TAA", L"EdgeHistoryPercent", 90, ini.c_str()), 0,
+                   95) *
+        .01f;
+    // SMAA Ultra runs on the resolved image (display only) unless turned off.
+    useSMAA = GetPrivateProfileIntW(L"TAA", L"SMAAEnabled", 1, ini.c_str()) != 0;
     wchar_t value[32]{};
     GetPrivateProfileStringW(L"TAA", L"DisplaySoftness", L"0", value, 32, ini.c_str());
     displaySoftness = std::clamp((float)_wtof(value), 0.f, 1.f);
