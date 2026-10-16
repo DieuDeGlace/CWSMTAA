@@ -1,5 +1,52 @@
 #include "AlphaTemporal.cpp"
 #include <cassert>
+static void edgeStabilityTest(D3DFORMAT format) {
+    useSMAA = false;
+    displaySoftness = 0;
+    auto variation = [&](float stability, bool thin) {
+        cleanup();
+        edgeStability = stability;
+        assert(initialize());
+        IDirect3DSurface9 *bb = nullptr, *cpu = nullptr;
+        dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+        assert(SUCCEEDED(dev->CreateOffscreenPlainSurface(width, height, format, D3DPOOL_SYSTEMMEM,
+                                                          &cpu, nullptr)));
+        int lo = 255, hi = 0;
+        for (float offset : {-.375f, -.25f, -.125f, 0.f, .125f, .25f, .375f}) {
+            assert(SUCCEEDED(dev->BeginScene()));
+            assert(SUCCEEDED(
+                dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000, 1, 0)));
+            D3DRECT shape = thin ? D3DRECT{64, 48, 65, 49} : D3DRECT{0, 0, 65, 96};
+            assert(SUCCEEDED(dev->Clear(1, &shape, D3DCLEAR_TARGET, 0xffffffff, 1, 0)));
+            jx = offset;
+            jy = 0;
+            worldSeen = true;
+            finished = false;
+            valid = false;
+            assert(apply());
+            assert(SUCCEEDED(dev->EndScene()));
+            assert(SUCCEEDED(dev->GetRenderTargetData(bb, cpu)));
+            D3DLOCKED_RECT lock{};
+            assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+            int value = ((BYTE *)lock.pBits)[48 * lock.Pitch + 64 * 4];
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+            int flat = ((BYTE *)lock.pBits)[4 * lock.Pitch + 4 * 4];
+            assert(flat == (thin ? 0 : 255));
+            cpu->UnlockRect();
+        }
+        drop(cpu);
+        drop(bb);
+        return hi - lo;
+    };
+    for (bool thin : {true, false}) {
+        int baseline = variation(0, thin), stabilized = variation(.24f, thin);
+        assert(stabilized < baseline - 2);
+        printf("High-contrast %s edge intensity range: %d -> %d; flat pixels unchanged: PASS\n",
+               thin ? "thin-model" : "silhouette", baseline, stabilized);
+    }
+    edgeStability = .24f;
+}
 int main() {
     self = GetModuleHandleW(nullptr);
     WNDCLASSW wc{};
@@ -33,6 +80,11 @@ int main() {
         useSMAA = (cycle % 4) >= 2;
         displaySoftness = cycle % 2 ? .5f : 0.f;
         assert(initialize());
+        if (!useSMAA)
+            assert(!edgesTexture && !weightsTexture && !spatialTexture && !areaLookup &&
+                   !searchLookup);
+        if (displaySoftness <= 0)
+            assert(!softnessShader);
         assert(!valid);
         for (int f = 0; f < 3; f++) {
             assert(SUCCEEDED(dev->BeginScene()));
@@ -97,11 +149,12 @@ int main() {
         for (auto *p : smaaShaders)
             assert(!p);
     }
+    edgeStabilityTest(mode.Format);
     cleanup();
     drop(dev);
     drop(api);
     DestroyWindow(window);
     puts(
-        "PASS: temporal-only, softness-only, SMAA-only postfilter, hybrid; history stays unblurred; native depth/state, HUD exclusion, twelve device resets.");
+        "PASS: fused resolve blur, optional legacy display filters without feedback, no unused display resources; native depth/state, HUD exclusion, twelve device resets.");
     return 0;
 }

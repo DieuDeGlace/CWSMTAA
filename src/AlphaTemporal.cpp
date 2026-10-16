@@ -14,11 +14,13 @@
 #include "smaa/AreaTex.h"
 #include "smaa/SearchTex.h"
 #include "smaa/SMAAEmbedded.h"
+#include "GpuPassTimer9.h"
 
 // D3D9 port of Steam TemporalAA's color rejection and fine-detail resolve.
 // Native depth is never replaced. Resolve runs at the world/HUD boundary.
 static HMODULE self;
 static IDirect3DDevice9 *dev;
+static GpuPassTimer9 gpuTimer;
 static void **vt;
 template <class T> static void drop(T *&p) {
     if (p) {
@@ -62,19 +64,20 @@ static IDirect3DPixelShader9 *shader = nullptr;
 static IDirect3DTexture9 *edgesTexture = nullptr, *weightsTexture = nullptr,
                          *spatialTexture = nullptr, *areaLookup = nullptr, *searchLookup = nullptr;
 static IDirect3DPixelShader9 *smaaShaders[3]{}, *softnessShader = nullptr;
-static bool useSMAA = true;
-static float displaySoftness = .5f;
+static bool useSMAA = false;
+static float displaySoftness = 0, resolveBlur = .12f, jitterScale = .75f, edgeStability = .24f;
 static float previousCamera[4]{}, previousProjection[2]{};
 static bool cameraKnown = false;
 static std::map<IDirect3DVertexShader9 *, bool> worldShaders;
 static const char *hlsl = R"HLSL(
 sampler2D scene:register(s0);sampler2D history:register(s1);
 float4 settings:register(c0);float4 offsets:register(c1);
+float4 edgeRules:register(c2);
 float4 resolve(float2 uv:TEXCOORD0):COLOR0{
  float2 original=uv;uv+=offsets.xy;float4 current=tex2D(scene,uv);
- float3 lo=current.rgb,hi=current.rgb,left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
+ float3 lo=current.rgb,hi=current.rgb,left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb,gaussian=0;
  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){
-  float3 c=tex2D(scene,uv+float2(x,y)*settings.xy).rgb;lo=min(lo,c);hi=max(hi,c);
+  float3 c=tex2D(scene,uv+float2(x,y)*settings.xy).rgb;lo=min(lo,c);hi=max(hi,c);gaussian+=c*(x==0?2:1)*(y==0?2:1);
   if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
  }
  float3 old=tex2D(history,original).rgb;
@@ -83,7 +86,12 @@ float4 resolve(float2 uv:TEXCOORD0):COLOR0{
  float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
  float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
  float accumulation=lerp(settings.z,max(settings.z,.78),thin);
- return float4(lerp(current.rgb,clamp(old,lo,hi),accumulation*settings.w*confidence),current.a);
+ float contrast=saturate(4*max(hi.r-lo.r,max(hi.g-lo.g,hi.b-lo.b)));
+ // Spatial coverage must stay consistent even when temporal history is rejected.
+ float stability=saturate(edgeRules.x)*contrast;
+ float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,saturate(offsets.w));
+ filtered=lerp(filtered,gaussian/16,stability);
+ return float4(lerp(filtered,clamp(old,lo,hi),accumulation*settings.w*confidence),current.a);
 }
 float4 soften(float2 uv:TEXCOORD0):COLOR0{
  float4 now=tex2D(scene,uv);float3 sum=0;
@@ -100,6 +108,7 @@ static float halton(UINT i, UINT base) {
     return r - .5f;
 }
 static void cleanup() {
+    gpuTimer.reset();
     drop(scene);
     drop(history);
     drop(shader);
@@ -151,13 +160,14 @@ static bool initialize() {
         drop(e);
         return result;
     };
-    ok =
-        ok && pixelShader(hlsl, "resolve", &shader) && pixelShader(hlsl, "soften", &softnessShader);
+    ok = ok && pixelShader(hlsl, "resolve", &shader);
+    if (ok && displaySoftness > 0)
+        ok = pixelShader(hlsl, "soften", &softnessShader);
     const char *entries[] = {"edges", "weights", "neighborhood"};
-    for (size_t i = 0; i < std::size(smaaShaders) && ok; i++)
+    for (size_t i = 0; useSMAA && i < std::size(smaaShaders) && ok; i++)
         ok = pixelShader(smaaSource, entries[i], &smaaShaders[i]);
     for (auto output : {&edgesTexture, &weightsTexture, &spatialTexture})
-        if (ok)
+        if (ok && useSMAA)
             ok = SUCCEEDED(
                 dev->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
                                    output == &spatialTexture ? desc.Format : D3DFMT_A8R8G8B8,
@@ -174,11 +184,12 @@ static bool initialize() {
         (*out)->UnlockRect(0);
         return true;
     };
-    ok = ok &&
-         lookup(AREATEX_WIDTH, AREATEX_HEIGHT, D3DFMT_A8L8, AREATEX_PITCH, areaTexBytes,
-                &areaLookup) &&
-         lookup(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, D3DFMT_L8, SEARCHTEX_PITCH, searchTexBytes,
-                &searchLookup);
+    if (useSMAA)
+        ok = ok &&
+             lookup(AREATEX_WIDTH, AREATEX_HEIGHT, D3DFMT_A8L8, AREATEX_PITCH, areaTexBytes,
+                    &areaLookup) &&
+             lookup(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, D3DFMT_L8, SEARCHTEX_PITCH, searchTexBytes,
+                    &searchLookup);
     if (compiler)
         FreeLibrary(compiler);
     if (!ok) {
@@ -293,6 +304,7 @@ static bool apply() {
     dev->GetViewport(&vp);
     scene->GetSurfaceLevel(0, &copy);
     history->GetSurfaceLevel(0, &old);
+    gpuTimer.begin(dev, "Alpha TAA (copy/resolve)", log);
     // D3D9 forbids StretchRect inside BeginScene. Suspend and resume the native
     // scene at its HUD boundary; keep BeginScene/EndScene balanced on failures.
     bool resume = SUCCEEDED(dev->EndScene());
@@ -330,8 +342,10 @@ static bool apply() {
             dev->SetSamplerState(i, D3DSAMP_SRGBTEXTURE, FALSE);
         }
         float constants[8] = {1.f / width, 1.f / height, weight, valid ? 1.f : 0.f,
-                              jx / width,  jy / height,  0,      0};
+                              jx / width,  jy / height,  0,      resolveBlur};
         dev->SetPixelShaderConstantF(0, constants, 2);
+        float stability[4] = {edgeStability, 0, 0, 0};
+        dev->SetPixelShaderConstantF(2, stability, 1);
         struct Vertex {
             float x, y, z, w, u, v;
         };
@@ -339,6 +353,7 @@ static bool apply() {
                       {width - .5f, -.5f, 0, 1, 1, 0},
                       {-.5f, height - .5f, 0, 1, 0, 1},
                       {width - .5f, height - .5f, 0, 1, 1, 1}};
+        gpuTimer.split();
         hr = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(Vertex));
         dev->SetTexture(0, nullptr);
         dev->SetTexture(1, nullptr);
@@ -358,6 +373,7 @@ static bool apply() {
     dev->SetDepthStencilSurface(ds);
     dev->SetViewport(&vp);
     internal = false;
+    gpuTimer.end();
     valid = SUCCEEDED(hr);
     drop(copy);
     drop(old);
@@ -448,12 +464,13 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
     }
     if (GetForegroundWindow() == cp.hFocusWindow && (GetAsyncKeyState(VK_F9) & 1)) {
         useSMAA = !useSMAA;
+        cleanup(); // Optional display resources are created only when requested.
         log(useSMAA ? "SMAA enabled." : "SMAA disabled; display softness retained.");
     }
     worldSeen = finished = false;
     frame++;
-    jx = halton(frame % 8 + 1, 2);
-    jy = halton(frame % 8 + 1, 3);
+    jx = halton(frame % 8 + 1, 2) * jitterScale;
+    jy = halton(frame % 8 + 1, 3) * jitterScale;
     HRESULT hr = oldPresent(d, a, b, w, r);
     if (FAILED(hr))
         valid = false;
@@ -499,10 +516,16 @@ static DWORD WINAPI worker(void *) {
     weight =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65, ini.c_str()), 0, 85) *
         .01f;
-    useSMAA = GetPrivateProfileIntW(L"TAA", L"SMAAEnabled", 1, ini.c_str()) != 0;
+    useSMAA = GetPrivateProfileIntW(L"TAA", L"SMAAEnabled", 0, ini.c_str()) != 0;
     wchar_t value[32]{};
-    GetPrivateProfileStringW(L"TAA", L"DisplaySoftness", L"0.50", value, 32, ini.c_str());
+    GetPrivateProfileStringW(L"TAA", L"DisplaySoftness", L"0", value, 32, ini.c_str());
     displaySoftness = std::clamp((float)_wtof(value), 0.f, 1.f);
+    GetPrivateProfileStringW(L"TAA", L"ResolveBlur", L"0.12", value, 32, ini.c_str());
+    resolveBlur = std::clamp((float)_wtof(value), 0.f, 1.f);
+    GetPrivateProfileStringW(L"TAA", L"JitterScale", L"0.75", value, 32, ini.c_str());
+    jitterScale = std::clamp((float)_wtof(value), 0.f, 1.f);
+    GetPrivateProfileStringW(L"TAA", L"EdgeStability", L"0.24", value, 32, ini.c_str());
+    edgeStability = std::clamp((float)_wtof(value), 0.f, .5f);
     DWORD base = (DWORD)(uintptr_t)GetModuleHandleW(nullptr);
     IMAGE_DOS_HEADER dos{};
     read(base, &dos, sizeof(dos));
@@ -542,7 +565,7 @@ static DWORD WINAPI worker(void *) {
             oldReset = (RESET)exchange(16, (void *)reset);
             oldDIP = (DIP)exchange(82, (void *)dip);
             oldPresent = (PRESENT)exchange(17, (void *)present);
-            log("AlphaTemporal Steam-port revision 2 attached (SMAA Ultra and display-only softness).");
+            log("AlphaTemporal Steam-stable test attached (fused resolve blur, reduced jitter, optional display filters off by default).");
             return 0;
         }
         Sleep(1000);
