@@ -28,6 +28,7 @@
 #include "smaa/AreaTex.h"
 #include "smaa/SearchTex.h"
 #include "smaa/SMAAEmbedded.h"
+#include "GpuPassTimer9.h"
 
 // IDirect3DDevice9 vtable slots that are hooked.
 static constexpr int SLOT_RESET = 16, SLOT_PRESENT = 17, SLOT_CLEAR = 43,
@@ -164,6 +165,7 @@ static float halton(UINT i, UINT base) {
 }
 
 static void cleanup() {
+    gpuTimer.reset();
     drop(scene);
     drop(history);
     drop(shader);
@@ -231,14 +233,15 @@ static bool initialize() {
         drop(e);
         return result;
     };
-    ok =
-        ok && pixelShader(hlsl, "resolve", &shader) && pixelShader(hlsl, "soften", &softnessShader);
+    ok = ok && pixelShader(hlsl, "resolve", &shader);
+    if (ok && displaySoftness > 0)
+        ok = pixelShader(hlsl, "soften", &softnessShader);
     const char *entries[] = {"edges", "weights", "neighborhood"};
-    for (size_t i = 0; i < std::size(smaaShaders) && ok; i++)
+    for (size_t i = 0; useSMAA && i < std::size(smaaShaders) && ok; i++)
         ok = pixelShader(smaaSource, entries[i], &smaaShaders[i]);
     // SMAA intermediates; the final SMAA output keeps the back-buffer format.
     for (auto output : {&edgesTexture, &weightsTexture, &spatialTexture})
-        if (ok)
+        if (ok && useSMAA)
             ok = SUCCEEDED(
                 dev->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
                                    output == &spatialTexture ? desc.Format : D3DFMT_A8R8G8B8,
@@ -356,12 +359,22 @@ static HRESULT display(IDirect3DSurface9 *target) {
 
 // True while the game renders into the back buffer (not an off-screen target).
 static bool backbuffer() {
-    IDirect3DSurface9 *rt = nullptr, *bb = nullptr;
+    if (!frameChecked) {
+        frameChecked = true;
+        frameUsable = SUCCEEDED(dev->TestCooperativeLevel());
+        IDirect3DSurface9 *bb = nullptr;
+        frameBackBuffer = nullptr;
+        if (frameUsable && SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+            frameBackBuffer = bb;
+            drop(bb);
+        }
+    }
+    if (!frameUsable || !frameBackBuffer)
+        return false;
+    IDirect3DSurface9 *rt = nullptr;
     dev->GetRenderTarget(0, &rt);
-    dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
-    bool same = rt && rt == bb;
+    bool same = rt && rt == frameBackBuffer;
     drop(rt);
-    drop(bb);
     return same;
 }
 
@@ -381,6 +394,7 @@ static bool apply() {
     dev->GetViewport(&vp);
     scene->GetSurfaceLevel(0, &copy);
     history->GetSurfaceLevel(0, &old);
+    gpuTimer.begin(dev, "Alpha TAA (copy/resolve)", log);
     // D3D9 forbids StretchRect inside BeginScene. Suspend and resume the native
     // scene at its HUD boundary; keep BeginScene/EndScene balanced on failures.
     bool resume = SUCCEEDED(dev->EndScene());
@@ -414,7 +428,7 @@ static bool apply() {
             setClampSampler(i, i ? D3DTEXF_POINT : D3DTEXF_LINEAR);
         }
         float constants[8] = {1.f / width, 1.f / height, weight, valid ? 1.f : 0.f,
-                              jx / width,  jy / height,  0,      0};
+                              jx / width,  jy / height,  0,      resolveBlur};
         dev->SetPixelShaderConstantF(0, constants, 2);
         hr = quad();
         dev->SetTexture(0, nullptr);
@@ -436,6 +450,7 @@ static bool apply() {
     dev->SetDepthStencilSurface(ds);
     dev->SetViewport(&vp);
     internal = false;
+    gpuTimer.end();
     valid = SUCCEEDED(hr);
     drop(copy);
     drop(old);
@@ -494,7 +509,7 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT b, UINT m
                           UINT p) {
     float saved[16]{};
     bool jittered = false;
-    if (!internal && enabled && !finished && backbuffer() && SUCCEEDED(d->TestCooperativeLevel())) {
+    if (!internal && enabled && !finished && backbuffer()) {
         IDirect3DVertexShader9 *vs = nullptr;
         d->GetVertexShader(&vs);
         bool accepted = worldShader(vs);
@@ -526,7 +541,7 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT b, UINT m
 static HRESULT WINAPI clear(IDirect3DDevice9 *d, DWORD n, const D3DRECT *r, DWORD flags, D3DCOLOR c,
                             float z, DWORD s) {
     if (!internal && worldSeen && !finished && (flags & D3DCLEAR_ZBUFFER) &&
-        !(flags & D3DCLEAR_TARGET) && backbuffer() && SUCCEEDED(d->TestCooperativeLevel()))
+        !(flags & D3DCLEAR_TARGET) && backbuffer())
         apply();
     return oldClear(d, n, r, flags, c, z, s);
 }
@@ -544,12 +559,13 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
     }
     if (GetForegroundWindow() == cp.hFocusWindow && (GetAsyncKeyState(VK_F9) & 1)) {
         useSMAA = !useSMAA;
+        cleanup(); // Optional display resources are created only when requested.
         log(useSMAA ? "SMAA enabled." : "SMAA disabled; display softness retained.");
     }
-    worldSeen = finished = false;
+    worldSeen = finished = frameChecked = false;
     frame++;
-    jx = halton(frame % 8 + 1, 2);
-    jy = halton(frame % 8 + 1, 3);
+    jx = halton(frame % 8 + 1, 2) * jitterScale;
+    jy = halton(frame % 8 + 1, 3) * jitterScale;
     HRESULT hr = oldPresent(d, a, b, w, r);
     if (FAILED(hr))
         valid = false;
@@ -559,7 +575,8 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
 static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
     cleanup();
     worldShaders.clear();
-    cameraKnown = worldSeen = finished = false;
+    cameraKnown = worldSeen = finished = frameChecked = false;
+    frameBackBuffer = nullptr;
     log("Temporal resources released before device reset.");
     return oldReset(d, p);
 }
@@ -606,9 +623,14 @@ static void loadSettings() {
     weight =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65, ini.c_str()), 0, 85) *
         .01f;
+    edgeHistory =
+        std::clamp((int)GetPrivateProfileIntW(L"TAA", L"EdgeHistoryPercent", 90, ini.c_str()), 0,
+                   95) *
+        .01f;
+    // SMAA Ultra runs on the resolved image (display only) unless turned off.
     useSMAA = GetPrivateProfileIntW(L"TAA", L"SMAAEnabled", 1, ini.c_str()) != 0;
     wchar_t value[32]{};
-    GetPrivateProfileStringW(L"TAA", L"DisplaySoftness", L"0.50", value, 32, ini.c_str());
+    GetPrivateProfileStringW(L"TAA", L"DisplaySoftness", L"0", value, 32, ini.c_str());
     displaySoftness = std::clamp((float)_wtof(value), 0.f, 1.f);
 }
 
